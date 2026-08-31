@@ -16,10 +16,14 @@ def _iter_candidate_paths(path: str | os.PathLike[str] | None = None) -> Iterabl
         yield Path(path).expanduser().resolve()
 
     project_root = Path(__file__).resolve().parent.parent
+    parent_root = project_root.parent
     yield project_root / "data" / DEFAULT_DATASET_NAME
+    yield parent_root / "data" / DEFAULT_DATASET_NAME
     yield project_root / "notebook_project" / "data" / DEFAULT_DATASET_NAME
     yield project_root / DEFAULT_DATASET_NAME
+    yield parent_root / DEFAULT_DATASET_NAME
     yield Path.cwd() / "data" / DEFAULT_DATASET_NAME
+    yield Path.cwd().parent / "data" / DEFAULT_DATASET_NAME
     yield Path.cwd() / DEFAULT_DATASET_NAME
 
     env_path = os.environ.get("NCC_DATASET_PATH")
