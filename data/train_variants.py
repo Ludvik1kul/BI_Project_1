@@ -1,0 +1,199 @@
+"""Resumable Lightning fine-tuning for the Llama model variants."""
+
+import argparse
+import csv
+import json
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["full", "last_layer"], required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--data", default="./data/train_data.jsonl")
+    parser.add_argument("--max-time", default=None, help="Lightning duration, e.g. 00:30:00")
+    parser.add_argument("--max-epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation", type=int, default=8)
+    parser.add_argument("--resume", default="auto", help="Checkpoint path, 'auto', or 'none'")
+    return parser.parse_args()
+
+
+def to_multitask(example):
+    if "prompt" in example and "target" in example:
+        return [example]
+    input_prompt = example["input_prompt"]
+    return [
+        {"prompt": "predict: " + input_prompt, "target": example["answer"]},
+        {"prompt": "explain: " + input_prompt, "target": example["answer_rationale"]},
+    ]
+
+
+class TextDataset(Dataset):
+    def __init__(self, records, tokenizer, max_length=512):
+        self.examples = []
+        for record in records:
+            encoded = tokenizer(
+                record["prompt"] + " " + record["target"] + tokenizer.eos_token,
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+            )
+            encoded["labels"] = [
+                token if mask else -100
+                for token, mask in zip(encoded["input_ids"], encoded["attention_mask"])
+            ]
+            self.examples.append(encoded)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        return {key: torch.tensor(value, dtype=torch.long) for key, value in self.examples[index].items()}
+
+
+def create_lightning_model_class():
+    import lightning.pytorch as pl
+
+    class CausalLanguageModel(pl.LightningModule):
+        def __init__(self, model, learning_rate=2e-5):
+            super().__init__()
+            self.model = model
+            self.learning_rate = learning_rate
+
+        def forward(self, **batch):
+            return self.model(**batch)
+
+        def training_step(self, batch, batch_index):
+            loss = self(**batch).loss
+            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+            return loss
+
+        def configure_optimizers(self):
+            trainable_parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+            return torch.optim.AdamW(trainable_parameters, lr=self.learning_rate)
+
+    return pl, CausalLanguageModel
+
+
+def create_loss_logger_class():
+    import lightning.pytorch as pl
+
+    class LossHistoryLogger(pl.Callback):
+        def __init__(self, path):
+            self.path = Path(path)
+            self.started_at = time.time()
+            self.last_logged_step = -1
+
+        def on_fit_start(self, trainer, pl_module):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists():
+                with self.path.open(newline="", encoding="utf-8") as source:
+                    rows = list(csv.DictReader(source))
+                if rows:
+                    self.last_logged_step = max(int(row["global_step"]) for row in rows)
+            else:
+                with self.path.open("w", newline="", encoding="utf-8") as target:
+                    csv.writer(target).writerow(["global_step", "epoch", "loss", "elapsed_seconds"])
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_index):
+            step = trainer.global_step
+            if step == 0:
+                return
+            if step <= self.last_logged_step:
+                return
+            loss = outputs.detach().float().item() if torch.is_tensor(outputs) else None
+            if loss is None:
+                return
+            with self.path.open("a", newline="", encoding="utf-8") as target:
+                csv.writer(target).writerow([
+                    step,
+                    trainer.current_epoch,
+                    f"{loss:.8f}",
+                    f"{time.time() - self.started_at:.2f}",
+                ])
+                target.flush()
+            self.last_logged_step = step
+
+    return LossHistoryLogger
+
+
+def find_resume_checkpoint(output_dir, resume):
+    if resume == "none":
+        return None
+    if resume != "auto":
+        return resume
+    last_checkpoint = Path(output_dir) / "checkpoints" / "last.ckpt"
+    return str(last_checkpoint) if last_checkpoint.exists() else None
+
+
+def main():
+    args = parse_args()
+    output_dir = Path(args.output)
+    checkpoint_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+
+    if args.mode == "last_layer":
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        for parameter in model.lm_head.parameters():
+            parameter.requires_grad = True
+
+    raw_records = [json.loads(line) for line in Path(args.data).read_text(encoding="utf-8").splitlines()]
+    train_records = [task for record in raw_records for task in to_multitask(record)]
+    train_dataset = TextDataset(train_records, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=1)
+
+    pl, CausalLanguageModel = create_lightning_model_class()
+    lightning_model = CausalLanguageModel(model)
+    LossHistoryLogger = create_loss_logger_class()
+    loss_logger = LossHistoryLogger(output_dir / "loss_history.csv")
+    checkpoint = pl.callbacks.ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="step-{step:08d}",
+        every_n_train_steps=1,
+        save_last=True,
+        save_top_k=-1,
+        save_on_train_epoch_end=False,
+    )
+    logger = pl.loggers.CSVLogger(save_dir=output_dir / "logs", name=args.mode)
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    precision = "bf16-mixed" if accelerator == "gpu" else "16-true"
+    trainer = pl.Trainer(
+        default_root_dir=output_dir,
+        accelerator=accelerator,
+        devices=1,
+        precision=precision,
+        max_epochs=args.max_epochs,
+        max_time=args.max_time,
+        accumulate_grad_batches=args.gradient_accumulation,
+        callbacks=[checkpoint, loss_logger],
+        logger=logger,
+        log_every_n_steps=1,
+        enable_progress_bar=True,
+    )
+
+    resume_checkpoint = find_resume_checkpoint(output_dir, args.resume)
+    print(f"Training {args.mode} variant with {len(train_dataset)} task records.")
+    print(f"Checkpointing every optimizer update under {checkpoint_dir}.")
+    print(f"Resuming from: {resume_checkpoint or 'model weights'}")
+    trainer.fit(lightning_model, train_loader, ckpt_path=resume_checkpoint)
+
+    model.save_pretrained(output_dir / "final")
+    tokenizer.save_pretrained(output_dir / "final")
+    print(f"Training stopped or completed. Latest weights saved to {output_dir / 'final'}.")
+
+
+if __name__ == "__main__":
+    main()
