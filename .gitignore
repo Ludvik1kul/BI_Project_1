@@ -1,5 +1,7 @@
 #local
 models/
+data/full_distilled/
+data/last_layer_distilled/
 secret.txt
 
 # Byte-compiled / optimized / DLL files

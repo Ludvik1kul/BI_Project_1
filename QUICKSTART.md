@@ -75,12 +75,17 @@ update. To run a bounded session, add for example:
 python .\data\train_variants.py --mode full --model .\models\llama-3.2-3b-distilled --output .\data\full_distilled --max-time 02:00:00
 ```
 
-Checkpoints are stored in `data/full_distilled/checkpoints/`, with the latest
-checkpoint at `last.ckpt`. CSV loss logs are stored in
+The single checkpoint is stored as `data/full_distilled/checkpoints/last.ckpt`
+and is overwritten after every optimizer update. CSV loss logs are stored in
 `data/full_distilled/logs/`. A stable update-level loss file is also written to
 `data/full_distilled/loss_history.csv`. Re-run the same command with `--resume auto` (the
 default) to restore model weights, optimizer state, scheduler state, epoch,
 global step, and random state. Use `--resume none` to deliberately start over.
+
+The training dataloader uses a resumable random sampler. Its shuffled
+permutation and current position are stored in `last.ckpt`, so restarting
+mid-epoch continues with the next unconsumed batch instead of restarting the
+epoch with a new shuffle order.
 
 Because checkpoints are written every optimizer update, the output directory
 can become large. Keep the checkpoint directory between sessions; removing it

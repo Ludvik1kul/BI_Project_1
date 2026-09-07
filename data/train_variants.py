@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -56,6 +56,61 @@ class TextDataset(Dataset):
 
     def __getitem__(self, index):
         return {key: torch.tensor(value, dtype=torch.long) for key, value in self.examples[index].items()}
+
+
+class ResumableRandomSampler(Sampler):
+    """Shuffled sampler whose permutation and cursor are checkpointable."""
+
+    def __init__(self, data_source, seed=42):
+        self.data_source = data_source
+        self.seed = seed
+        self.generator = torch.Generator()
+        self.generator.manual_seed(seed)
+        self.epoch = 0
+        self.position = 0
+        self.permutation = []
+        self._start_epoch()
+
+    def _start_epoch(self):
+        self.permutation = torch.randperm(len(self.data_source), generator=self.generator).tolist()
+        self.position = 0
+
+    def __iter__(self):
+        while self.position < len(self.permutation):
+            index = self.permutation[self.position]
+            self.position += 1
+            yield index
+        self.epoch += 1
+        self._start_epoch()
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def state_dict(self):
+        return {
+            "seed": self.seed,
+            "epoch": self.epoch,
+            "position": self.position,
+            "permutation": self.permutation,
+            "generator_state": self.generator.get_state(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.seed = state_dict["seed"]
+        self.epoch = state_dict["epoch"]
+        self.position = state_dict["position"]
+        self.permutation = state_dict["permutation"]
+        self.generator.set_state(state_dict["generator_state"])
+
+
+class ResumableDataLoader(DataLoader):
+    """DataLoader state wrapper recognized by Lightning's checkpoint logic."""
+
+    def state_dict(self):
+        return {"sampler": self.sampler.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self.sampler.load_state_dict(state_dict["sampler"])
 
 
 def create_lightning_model_class():
@@ -153,7 +208,13 @@ def main():
     raw_records = [json.loads(line) for line in Path(args.data).read_text(encoding="utf-8").splitlines()]
     train_records = [task for record in raw_records for task in to_multitask(record)]
     train_dataset = TextDataset(train_records, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=1)
+    sampler = ResumableRandomSampler(train_dataset)
+    train_loader = ResumableDataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=0,
+    )
 
     pl, CausalLanguageModel = create_lightning_model_class()
     lightning_model = CausalLanguageModel(model)
@@ -161,11 +222,13 @@ def main():
     loss_logger = LossHistoryLogger(output_dir / "loss_history.csv")
     checkpoint = pl.callbacks.ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename="step-{step:08d}",
+        filename="last",
+        auto_insert_metric_name=False,
         every_n_train_steps=1,
-        save_last=True,
-        save_top_k=-1,
+        save_last=False,
+        save_top_k=1,
         save_on_train_epoch_end=False,
+        enable_version_counter=False,
     )
     logger = pl.loggers.CSVLogger(save_dir=output_dir / "logs", name=args.mode)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
@@ -187,6 +250,7 @@ def main():
     resume_checkpoint = find_resume_checkpoint(output_dir, args.resume)
     print(f"Training {args.mode} variant with {len(train_dataset)} task records.")
     print(f"Checkpointing every optimizer update under {checkpoint_dir}.")
+    print("Using a resumable sampler; dataloader position will be restored from the checkpoint.")
     print(f"Resuming from: {resume_checkpoint or 'model weights'}")
     trainer.fit(lightning_model, train_loader, ckpt_path=resume_checkpoint)
 
