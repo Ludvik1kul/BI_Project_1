@@ -68,6 +68,13 @@ python .\data\train_variants.py --mode last_layer --model .\models\llama-3.2-3b-
 
 The baseline copy is not trained. Do not pass `val_data.jsonl` or `multitask_val.jsonl` to the training script.
 
+## Compare Models
+
+Run **cell 21** after the model you want to test exists. Choose `Untrained`,
+`Full`, or `Final layer`, enter a prompt, and click `Generate`. The widget uses
+the exact `predict:` prefix used during training. The trained model paths are
+`data/full_distilled/final` and `data/last_layer_distilled/final`.
+
 Training uses PyTorch Lightning and writes a checkpoint after every optimizer
 update. To run a bounded session, add for example:
 
