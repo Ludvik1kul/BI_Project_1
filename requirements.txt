@@ -1,1 +1,10 @@
 pandas>=2.0
+numpy>=1.24
+requests>=2.31
+sympy>=1.12
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+lightning>=2.2
+huggingface_hub>=0.22
+ipywidgets>=8.1
