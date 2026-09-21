@@ -1,17 +1,23 @@
-"""Resumable Lightning fine-tuning for the Llama model variants."""
+"""Resumable Lightning fine-tuning for the Llama model variants.
+See parse_args() for usage example.
+Requires most of the pipeline.ipynb notebooke to be ran first, run this script when told to. 
+To run both the full and last-layer variants, run this script twice with --mode full and --mode last_layer.
+In total this should take about 30 hours on a laptop. 
+"""
 
 import argparse
 import csv
 import json
 import time
 from pathlib import Path
-
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def parse_args():
+    # Example usage:
+    # python data/train_variants.py --mode full --model ./models/llama-3.2-3b --output ./models/llama-3.2-3b-full-distilled --max-time 00:00:30:00
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["full", "last_layer"], required=True)
     parser.add_argument("--model", required=True)

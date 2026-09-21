@@ -1,110 +1,127 @@
-# Quick Start Guide - Knowledge Distillation Pipeline
+# Quick Start Guide
 
-## Notebook Cell Order
+This repository contains a Llama 3.2 3B derivative-distillation experiment.
+The notebook prepares data and evaluation; training is started separately with
+`data/train_variants.py`.
 
-The numbers below refer to the current top-to-bottom order in `pipeline.ipynb`.
+## Prerequisites
 
-1. **Cell 1:** Set `OPENROUTER_API_KEY` in the environment. No key is stored in the notebook.
-2. **Cell 2:** Download or load the local Llama model.
-3. **Cell 3:** Create the OpenRouter teacher client.
-4. **Cell 4:** Load the mathematical function and prompt generators.
-5. **Cells 5-10:** Setup and status cells. They do not generate data, call the API, copy models, or train.
-6. **Cell 11:** Load the black-box distillation functions.
-7. **Cell 13:** Run the schema validation check.
+Run all commands from the repository root:
 
-Run cells 1-4, 11, and 13 in that order before starting the workflow. Cells 12, 14, 17, 19, and 20 are not required for the normal workflow.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-## Generate New Data
+If the notebook kernel is unavailable, or Transformers reports that
+`device_map="auto"` requires another package, install the missing notebook
+runtime dependencies in the active environment:
 
-Set the API key outside the notebook. Then run cells 1-4, 11, and 13. In **cell 15**, uncomment and run:
+```powershell
+python -m pip install ipykernel accelerate
+```
+
+The base Llama model is gated on Hugging Face. Accept the model license and
+authenticate before running the model-loading cell. The model and each copy
+require several gigabytes of disk space. Training the 3B model also requires
+substantial RAM/VRAM, an estimated 24GB minimum.
+
+Open the notebook with the repository root as its working directory:
+
+
+## Recommended Notebook Run
+
+Run the cells from the top through the helper/status cells in order:
+
+1. Read the introductory markdown cell.
+2. Run the imports cell.
+3. Run the environment-key cell. `OPENROUTER_API_KEY` is only required to
+  generate new teacher data.
+4. Run the model-loading cell if the local base model is not already available.
+  It downloads and loads `models/llama-3.2-3b` and performs a small chat test.
+5. Run the teacher-client, function-generator, and orchestration cells.
+6. Run the parser, strict-generation, and JSONL-writer definition cells.
+7. Run the helper/status cells.
+
+Do not use **Run All** with the current notebook. Two cells that are labelled
+optional are currently executable: the new-data cell calls OpenRouter
+immediately, and the legacy-migration cell expects a file that is not in this
+repository. Skip both unless their prerequisites have been supplied.
+
+The repository already contains `data/distillation_data.jsonl`,
+`data/train_data.jsonl`, and `data/val_data.jsonl`, so the normal reproduction
+path does not need an API call or the migration cell.
+
+## Generate New Teacher Data
+
+Only do this when `OPENROUTER_API_KEY` is set and you intend to replace the
+checked-in dataset. Run the strict-generation definitions first, then run:
 
 ```python
 records = generate_distillation_data(deepseek, num_examples=200)
 ```
 
-Each teacher request explicitly asks for JSON with both fields:
+The teacher is asked for JSON containing non-empty `answer_rationale` and
+`answer` fields. Invalid responses are retried up to three times. The cell
+writes:
 
-```json
-{
-  "answer_rationale": "step-by-step reasoning",
-  "answer": "final answer only"
-}
-```
+- `data/distillation_data.jsonl`
+- `data/train_data.jsonl`
+- `data/val_data.jsonl`
+- `data/multitask_train.jsonl`
+- `data/multitask_val.jsonl`
 
-Invalid JSON or a missing or empty field is retried up to three times. Invalid records are never written. Successful generation creates these files in `data/`:
+Training expands each source record into two tasks: `predict:` targets the
+final answer and `explain:` targets the rationale.
 
-- `distillation_data.jsonl`: records with `input_prompt`, `answer_rationale`, and `answer`.
-- `train_data.jsonl`: training split.
-- `val_data.jsonl`: validation split, kept outside training.
-- `multitask_train.jsonl` and `multitask_val.jsonl`: paired task records.
+## Prepare Model Variants
 
-Each source example produces two records with the same input. `predict: <input prompt>` targets `answer`; `explain: <input prompt>` targets `answer_rationale`. Use `inference_prompts(input_prompt)` so inference uses the exact same prefixes.
-
-## Make Model Copies
-
-After loading the functions in cell 11, run **cell 18** once by uncommenting:
+Run the model-copy cell once after the orchestration definitions:
 
 ```python
 model_variants = prepare_model_variants()
 ```
 
-This creates independent `baseline`, `distilled`, and `last_layer` copies. The source model is not modified. Each copy is approximately 13 GB.
+This creates independent copies at:
 
-## Training Script
+- `models/llama-3.2-3b-baseline`
+- `models/llama-3.2-3b-distilled`
+- `models/llama-3.2-3b-last-layer`
 
-The Lightning training script is already available at `data/train_variants.py`.
-Cell 16 only confirms its location. Do not use the older
-`write_training_script()` helper, because it would overwrite the resumable
-Lightning trainer. In `last_layer` mode, only `lm_head` is trainable.
+The source model is not modified. The baseline is not trained.
 
-## Train The Variants
+## Train
 
-Run these commands from the repository root after cell 15 has generated data:
+From the repository root, run one or both variants:
 
 ```powershell
 python .\data\train_variants.py --mode full --model .\models\llama-3.2-3b-distilled --output .\data\full_distilled
 python .\data\train_variants.py --mode last_layer --model .\models\llama-3.2-3b-last-layer --output .\data\last_layer_distilled
 ```
 
-The baseline copy is not trained. Do not pass `val_data.jsonl` or `multitask_val.jsonl` to the training script.
+The default input is `data/train_data.jsonl`; validation data is not used by
+the trainer. In `last_layer` mode, only `lm_head` is trainable.
 
-## Compare Models
-
-Run **cell 21** after the model you want to test exists. Choose `Untrained`,
-`Full`, or `Final layer`, enter a prompt, and click `Generate`. The widget uses
-the exact `predict:` prefix used during training. The trained model paths are
-`data/full_distilled/final` and `data/last_layer_distilled/final`.
-
-Training uses PyTorch Lightning and writes a checkpoint after every optimizer
-update. To run a bounded session, add for example:
+Training writes a resumable checkpoint to `data/<variant>/checkpoints/last.ckpt`,
+CSV logs under `data/<variant>/logs/`, a loss history CSV, and final model files
+under `data/<variant>/final/`. Re-running the same command resumes automatically.
+Use `--resume none` to deliberately restart. For a bounded run, add for example:
 
 ```powershell
 python .\data\train_variants.py --mode full --model .\models\llama-3.2-3b-distilled --output .\data\full_distilled --max-time 02:00:00
 ```
 
-The single checkpoint is stored as `data/full_distilled/checkpoints/last.ckpt`
-and is overwritten after every optimizer update. CSV loss logs are stored in
-`data/full_distilled/logs/`. A stable update-level loss file is also written to
-`data/full_distilled/loss_history.csv`. Re-run the same command with `--resume auto` (the
-default) to restore model weights, optimizer state, scheduler state, epoch,
-global step, and random state. Use `--resume none` to deliberately start over.
+## Evaluate And Compare
 
-The training dataloader uses a resumable random sampler. Its shuffled
-permutation and current position are stored in `last.ckpt`, so restarting
-mid-epoch continues with the next unconsumed batch instead of restarting the
-epoch with a new shuffle order.
+After the final model directories exist:
 
-Because checkpoints are written every optimizer update, the output directory
-can become large. Keep the checkpoint directory between sessions; removing it
-removes the resumable training state.
+- Run the model chat widget cell to compare the untrained, full-distilled, and
+  last-layer models interactively.
+- Run the loss-plot cell to create `training_loss_curves.png`.
+- Run the validation cell to evaluate all three models by difficulty and
+  function type. It requires `data/val_data.jsonl` and both trained final
+  directories.
 
-## Troubleshooting
+In the notebook these plots are hardcoded to be certain runs, update with fitting paths.
 
-**OpenRouter error:** confirm `OPENROUTER_API_KEY` is set and optionally set `OPENROUTER_MODEL`.
-
-**Missing data:** run cell 15 after cells 1-4, 11, and 13.
-
-**Missing trainer:** restore `data/train_variants.py`; cell 16 does not generate it.
-
-**CUDA out of memory:** reduce `--batch-size` or increase
-`--gradient-accumulation`.
