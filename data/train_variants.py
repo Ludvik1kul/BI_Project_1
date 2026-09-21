@@ -39,16 +39,24 @@ class TextDataset(Dataset):
     def __init__(self, records, tokenizer, max_length=512):
         self.examples = []
         for record in records:
-            encoded = tokenizer(
-                record["prompt"] + " " + record["target"] + tokenizer.eos_token,
-                truncation=True,
-                max_length=max_length,
-                padding="max_length",
-            )
-            encoded["labels"] = [
-                token if mask else -100
-                for token, mask in zip(encoded["input_ids"], encoded["attention_mask"])
-            ]
+            prompt_tokens = tokenizer(record["prompt"] + " ", add_special_tokens=False)["input_ids"]
+            target_tokens = tokenizer(
+                record["target"] + tokenizer.eos_token,
+                add_special_tokens=False,
+            )["input_ids"]
+            input_ids = (prompt_tokens + target_tokens)[:max_length]
+            target_start = min(len(prompt_tokens), len(input_ids))
+            attention_mask = [1] * len(input_ids)
+            labels = [-100] * target_start + input_ids[target_start:]
+            padding_length = max_length - len(input_ids)
+            input_ids += [tokenizer.pad_token_id] * padding_length
+            attention_mask += [0] * padding_length
+            labels += [-100] * padding_length
+            encoded = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
             self.examples.append(encoded)
 
     def __len__(self):
@@ -117,7 +125,7 @@ def create_lightning_model_class():
     import lightning.pytorch as pl
 
     class CausalLanguageModel(pl.LightningModule):
-        def __init__(self, model, learning_rate=2e-5):
+        def __init__(self, model, learning_rate=1e-6):
             super().__init__()
             self.model = model
             self.learning_rate = learning_rate
@@ -127,6 +135,8 @@ def create_lightning_model_class():
 
         def training_step(self, batch, batch_index):
             loss = self(**batch).loss
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite training loss at batch {batch_index}: {loss.item()}")
             self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
             return loss
 
@@ -232,7 +242,7 @@ def main():
     )
     logger = pl.loggers.CSVLogger(save_dir=output_dir / "logs", name=args.mode)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    precision = "bf16-mixed" if accelerator == "gpu" else "16-true"
+    precision = "bf16-mixed" if accelerator == "gpu" else "32-true"
     trainer = pl.Trainer(
         default_root_dir=output_dir,
         accelerator=accelerator,
